@@ -106,6 +106,7 @@ totalDevices = 0
 selectedDevices = 0
 totalSize = 0
 selectedSize = 0
+talliedDevices =[]
 
 # These are global so they can be accessed from all Callback objects.  The
 # basic callback defines its membership as anything that doesn't pass the
@@ -136,6 +137,34 @@ class Callbacks(object):
 
     def addToUI(self, device_data):
         pass
+
+    def incrementDeviceCount(self, device_data):
+        """Update the selected and total device counts when a device is added."""
+
+        deviceName = udev_device_get_name(device_data[UDEV_DATA])
+        deviceSize = device_data[UDEV_DATA]["XXX_SIZE"]
+
+        self._incrementDeviceCount(deviceName, deviceSize, device_data[ACTIVE_IN_UI])
+
+
+    def _incrementDeviceCount(self, deviceName, deviceSize, isActiveInUI):
+        global totalDevices, totalSize
+        global selectedDevices, selectedSize
+        global talliedDevices
+
+        # do not tally devices that were already counted
+        if deviceName in talliedDevices:
+            return
+
+        talliedDevices.append(deviceName)
+
+        totalDevices += 1
+        totalSize += deviceSize
+
+        if if isActiveInUI:
+            selectedDevices += 1
+            selectedSize += deviceSize
+
 
     def deviceToggled(self, set, device):
         global selectedDevices, totalDevices
@@ -216,6 +245,29 @@ class MPathCallbacks(FilteredCallbacks):
         if not device_data[INTERCONNECT_COL] in self._interconnects:
             self._interconnects.append(device_data[INTERCONNECT_COL])
 
+    def incrementDeviceCount(self, device_data):
+        """Updates the selected and total device count taking into account the possibility
+        that a non-multipath device can turn into a multipath device thereby not
+        incrementing the device count.
+        """
+        global talliedDevices
+
+        deviceName = udev_device_get_name(device_data[UDEV_DATA])
+        mpathName = udev_device_get_multipath_name(device_data[UDEV_DATA])
+        deviceSize = device_data[UDEV_DATA]["XXX_SIZE"]
+
+        if mpathName is None:
+            super(MPathCallbacks, self).incrementDeviceCount(device_data)
+            return
+
+        # if a device was single but joined a multipath container, then we should swap out the
+        # name so that it is appropriately skipped for incrementing our count and size
+        if deviceName in talliedDevices:
+            talliedDevices.remove(deviceName)
+            talliedDevices.append(mpathName)
+
+        self._incrementDeviceCount(mpathName, deviceSize, device_data[ACTIVE_IN_UI])
+
     def isMember(self, info):
         return info and isMultipath(info)
 
@@ -281,7 +333,7 @@ class OtherCallbacks(MPathCallbacks):
         self.notebook = self.xml.get_widget("otherNotebook")
 
         self.vendorEntry = self.xml.get_widget("otherVendorEntry")
-        self.interconnectEntry = self.xml.get_widget("otherInterconnectEntry")
+        self.interconnectEntry = self.xml.get_widget("otherInterconnectEntry")S
         self.IDEntry = self.xml.get_widget("otherIDEntry")
 
         self.otherFilterHBox = self.xml.get_widget("otherFilterHBox")
@@ -292,7 +344,7 @@ class OtherCallbacks(MPathCallbacks):
         self.IDEntry.connect("changed", lambda entry: self.model.get_model().refilter())
 
     def isMember(self, info):
-        return info and isOther(info)
+        return return info and isOther(info) and not isMultipath(info)
 
 class SearchCallbacks(FilteredCallbacks):
     def __init__(self, *args, **kwargs):
@@ -316,6 +368,11 @@ class SearchCallbacks(FilteredCallbacks):
         self.targetEntry.connect("changed", lambda entry: self.model.get_model().refilter())
         self.LUNEntry.connect("changed", lambda entry: self.model.get_model().refilter())
         self.IDEntry.connect("changed", lambda entry: self.model.get_model().refilter())
+
+    # Search window shows all devices, do not let it double count them
+    def incrementDeviceCount(self, device_data):
+        """Override the method to never increment device counts when simply searching in the UI."""
+        return
 
     def isMember(self, info):
         return True
@@ -738,32 +795,24 @@ class FilterWindow(InstallWindow):
         for row in self.store:
             if row[4] == component['DEVNAME']:
                 self.store.remove(row.iter)
-                return
+            # Also check for mpath devices to depopulate if they have been updated
+            elif 'ID_MPATH_NAME' in component and row[4] == component['ID_MPATH_NAME']:
+                self.store.remove(row.iter)
+        return
 
     def populate(self, nonraids, mpaths, raids, activeByDefault=False):
         def _addDeviceData(device_data):
             global totalDevices, totalSize
             global selectedDevices, selectedSize
-            added = False
 
             self.store.append(None, device_data)
 
+            # for each page in the notebook, check to see if each existing device should
+            # be added to the user interface and added to the device tally
             for pg in self.pages:
                 if pg.cb.isMember(device_data[UDEV_DATA]):
-                    added = True
                     pg.cb.addToUI(device_data)
-
-            # Only update the size label if this device was added to any pages.
-            # This prevents situations where we're only displaying the basic
-            # filter that has one disk, but there are several advanced disks
-            # in the store that cannot be seen.
-            if added:
-                totalDevices += 1
-                totalSize += device_data[UDEV_DATA]["XXX_SIZE"]
-
-                if device_data[ACTIVE_IN_UI]:
-                    selectedDevices += 1
-                    selectedSize += device_data[UDEV_DATA]["XXX_SIZE"]
+                    pg.cb.incrementDeviceCount(device_data)
 
         def _isProtected(info):
             protectedNames = map(udev_resolve_devspec, self.anaconda.protected)
@@ -940,12 +989,7 @@ class FilterWindow(InstallWindow):
             # However, we do need all the paths making up this multipath set.
             paths = "\n".join(map(udev_device_get_name, mpath))
 
-            # We use a copy here, so as to not modify the original udev info
-            # dict as that would break NameCache matching
-            data = mpath[0].copy()
-            # This will swap the device name (eg: sda) for the mpath name (eg: mpatha)
-            data["name"] = udev_device_get_multipath_name(mpath[0])
-            device_data = (data, True, _active(data), _isProtected(data),
+            device_data = (mpath[0], True, _active(mpath[0]), _isProtected(mpath[0]),
                      udev_device_get_multipath_name(mpath[0]), model,
                      long(mpath[0]["XXX_SIZE"]),
                      udev_device_get_vendor(mpath[0]),
